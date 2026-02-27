@@ -14,7 +14,6 @@ logger = logging.getLogger("astrbot")
 def create_dynamic_tool_instance(name, description, schema, code):
     """动态创建一个 FunctionTool 实例"""
     namespace = {}
-    # 在命名空间中执行代码，以获取定义的函数和导入
     exec(code, namespace)
     handler = namespace.get('handler')
     
@@ -40,10 +39,9 @@ def create_dynamic_tool_instance(name, description, schema, code):
 
 @dataclass
 class ToolMakerTool(FunctionTool):
-    # 严格按照 FunctionTool 可能要求的顺序定义字段
-    # 不要在这里放任何非 Pydantic 字段
+    # 这里的字段严格对应基类 FunctionTool 的期望
     name: str = "create_new_tool"
-    description: str = "为机器人创建一个新的持久化工具。你需要提供工具名称、描述、JSON Schema 参数定义以及 Python 代码。代码中必须包含 handler(context, **kwargs) 函数。"
+    description: str = "为机器人创建一个新的持久化工具。代码中必须包含 handler(context, **kwargs) 函数。"
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -52,46 +50,47 @@ class ToolMakerTool(FunctionTool):
                 "tool_description": {"type": "string", "description": "工具的功能描述"},
                 "parameters_schema": {
                     "type": "object", 
-                    "description": "工具参数的 JSON Schema。例如: {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}"
+                    "description": "工具参数的 JSON Schema。"
                 },
                 "python_code": {
                     "type": "string", 
-                    "description": "包含 handler(context, **kwargs) 函数定义的 Python 代码。可以包含 import 语句。"
+                    "description": "包含 handler(context, **kwargs) 函数定义的 Python 代码。"
                 }
             },
             "required": ["tool_name", "tool_description", "parameters_schema", "python_code"]
         }
     )
 
+    # 我们不在类定义里写 plugin，避免 Pydantic 验证它
+    # 在运行时我们会手动绑定 self.plugin_instance
+
     async def call(self, context: ContextWrapper, **kwargs) -> ToolExecResult:
+        # 使用 getattr 安全获取手动绑定的插件实例
+        plugin = getattr(self, "plugin_instance", None)
+        if not plugin:
+            return "工具配置错误：插件实例未绑定。"
+
         name = kwargs.get("tool_name")
         description = kwargs.get("tool_description")
         schema = kwargs.get("parameters_schema")
         code = kwargs.get("python_code")
         
-        # 这里的 self.plugin 是在外部手动赋值的
-        if not hasattr(self, 'plugin'):
-            return "插件上下文未就绪。"
-
         try:
-            # 尝试创建实例以验证代码
             tool_instance = create_dynamic_tool_instance(name, description, schema, code)
             
-            # 保存到文件
             data = {
                 "name": name,
                 "description": description,
                 "parameters": schema,
                 "code": code
             }
-            filepath = os.path.join(self.plugin.tools_dir, f"{name}.json")
+            filepath = os.path.join(plugin.tools_dir, f"{name}.json")
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             
-            # 立即注册到当前上下文
-            self.plugin.context.add_llm_tools(tool_instance)
+            plugin.context.add_llm_tools(tool_instance)
             
-            return f"成功创建并注册工具：{name}。现在你可以直接使用它了。"
+            return f"成功创建并注册工具：{name}。"
         except Exception as e:
             logger.error(f"创建工具失败: {e}", exc_info=True)
             return f"创建工具失败: {str(e)}"
@@ -104,22 +103,19 @@ class ToolMakerPlugin(Star):
         if not os.path.exists(self.tools_dir):
             os.makedirs(self.tools_dir)
             
-        # 1. 先实例化 Tool (不传参数给构造函数，避免 Pydantic 验证错误)
+        # 正确的实例化方式：
+        # 1. 无参实例化，让 Pydantic 使用默认的字符串字段
         tool = ToolMakerTool()
-        # 2. 手动绑定插件实例
-        tool.plugin = self
+        # 2. 动态绑定插件实例到工具对象上，绕过 Pydantic 检查
+        tool.plugin_instance = self
         
-        # 3. 注册工具
         self.context.add_llm_tools(tool)
-            
-        # 加载已保存的工具
         self.load_saved_tools()
 
     def load_saved_tools(self):
-        count = 0
         if not os.path.exists(self.tools_dir):
             return
-            
+        count = 0
         for filename in os.listdir(self.tools_dir):
             if filename.endswith(".json"):
                 try:
@@ -143,7 +139,6 @@ class ToolMakerPlugin(Star):
             for filename in os.listdir(self.tools_dir):
                 if filename.endswith(".json"):
                     tools.append(filename[:-5])
-        
         if not tools:
             yield event.plain_result("当前没有动态创建的工具。")
         else:
