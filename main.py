@@ -37,78 +37,15 @@ def create_dynamic_tool_instance(name, description, schema, code):
     
     return DynamicTool()
 
-@dataclass
-class ToolMakerTool(FunctionTool):
-    # 严格遵循 Pydantic Dataclass 规范，不定义自定义 __init__
-    name: str = "create_new_tool"
-    description: str = "为机器人创建一个新的持久化工具。代码中必须包含 handler(context, **kwargs) 函数。"
-    parameters: dict = Field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {
-                "tool_name": {"type": "string", "description": "工具的唯一标识名称（英文）"},
-                "tool_description": {"type": "string", "description": "工具的功能描述"},
-                "parameters_schema": {
-                    "type": "object", 
-                    "description": "工具参数的 JSON Schema。"
-                },
-                "python_code": {
-                    "type": "string", 
-                    "description": "包含 handler(context, **kwargs) 函数定义的 Python 代码。"
-                }
-            },
-            "required": ["tool_name", "tool_description", "parameters_schema", "python_code"]
-        }
-    )
-
-    async def call(self, context: ContextWrapper, **kwargs) -> ToolExecResult:
-        # 动态从 context 中获取插件实例
-        plugin = None
-        agent_context = context.context # 这通常是 AstrAgentContext
-        if hasattr(agent_context, 'star_instances'):
-            # 尝试通过名字获取插件实例
-            plugin = agent_context.star_instances.get("astrbot_plugin_tool_maker")
-        
-        if not plugin:
-            return "错误：无法在当前上下文中定位 ToolMaker 插件实例。请确保插件已正确加载。"
-
-        name = kwargs.get("tool_name")
-        description = kwargs.get("tool_description")
-        schema = kwargs.get("parameters_schema")
-        code = kwargs.get("python_code")
-        
-        try:
-            tool_instance = create_dynamic_tool_instance(name, description, schema, code)
-            
-            data = {
-                "name": name,
-                "description": description,
-                "parameters": schema,
-                "code": code
-            }
-            # 使用插件实例中的 tools_dir
-            filepath = os.path.join(plugin.tools_dir, f"{name}.json")
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            
-            plugin.context.add_llm_tools(tool_instance)
-            
-            return f"成功创建并注册工具：{name}。"
-        except Exception as e:
-            logger.error(f"创建工具失败: {e}", exc_info=True)
-            return f"创建工具失败: {str(e)}"
-
-@register("astrbot_plugin_tool_maker", "Gemini CLI", "自动工具编写插件", "1.3.1")
+@register("astrbot_plugin_tool_maker", "Gemini CLI", "自动工具编写插件", "1.4.0")
 class ToolMakerPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.tools_dir = os.path.join(os.path.dirname(__file__), "tools")
         if not os.path.exists(self.tools_dir):
             os.makedirs(self.tools_dir)
-            
-        # 实例化时不传递任何参数，完全避开 Pydantic 验证错误
-        self.context.add_llm_tools(ToolMakerTool())
-            
+        
+        # 立即加载已保存的工具
         self.load_saved_tools()
 
     def load_saved_tools(self):
@@ -129,6 +66,41 @@ class ToolMakerPlugin(Star):
                     logger.error(f"加载动态工具 {filename} 失败: {e}")
         if count > 0:
             logger.info(f"已加载 {count} 个动态工具")
+
+    # 使用 @filter.command 的变体或直接通过 docstring 让框架识别为工具
+    # 这种方式直接利用插件实例的方法，不再需要单独定义 Tool 类
+    @filter.command("create_new_tool")
+    async def create_new_tool(self, event: AstrMessageEvent, tool_name: str, tool_description: str, parameters_schema: dict, python_code: str):
+        """
+        为机器人创建一个新的持久化工具。
+        参数:
+        tool_name (string): 工具的唯一标识名称（英文）
+        tool_description (string): 工具的功能描述
+        parameters_schema (dict): 工具参数的 JSON Schema。
+        python_code (string): 包含 handler(context, **kwargs) 函数定义的 Python 代码。
+        """
+        try:
+            # 验证并创建实例
+            tool_instance = create_dynamic_tool_instance(tool_name, tool_description, parameters_schema, python_code)
+            
+            # 保存到文件
+            data = {
+                "name": tool_name,
+                "description": tool_description,
+                "parameters": parameters_schema,
+                "code": python_code
+            }
+            filepath = os.path.join(self.tools_dir, f"{tool_name}.json")
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            # 注册到当前上下文
+            self.context.add_llm_tools(tool_instance)
+            
+            yield event.plain_result(f"成功创建并注册工具：{tool_name}。现在你可以直接使用它了。")
+        except Exception as e:
+            logger.error(f"创建工具失败: {e}", exc_info=True)
+            yield event.plain_result(f"创建工具失败: {str(e)}")
 
     @filter.command("tools")
     async def list_tools(self, event: AstrMessageEvent):
