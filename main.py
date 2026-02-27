@@ -4,10 +4,54 @@ import inspect
 import logging
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.model import ToolExecResult
 
 logger = logging.getLogger("astrbot")
 
-@register("astrbot_plugin_tool_maker", "Gemini CLI", "自动工具编写插件", "1.5.0")
+def create_dynamic_tool_instance(name, description, schema, code):
+    """动态创建一个工具实例"""
+    namespace = {}
+    # 在命名空间中预注入一些常用库
+    namespace.update({
+        "os": os,
+        "json": json,
+        "logger": logger
+    })
+    
+    try:
+        exec(code, namespace)
+    except Exception as e:
+        raise ValueError(f"代码语法错误: {str(e)}")
+        
+    handler = namespace.get('handler')
+    if not handler:
+        raise ValueError("代码中未找到 handler(args) 函数")
+
+    # 我们定义一个兼容接口，而不是直接继承 FunctionTool 避开框架扫描
+    class DynamicToolProxy:
+        def __init__(self):
+            self.name = name
+            self.description = description
+            self.parameters = schema
+
+        async def call(self, *args, **kwargs):
+            # 处理 AstrBot 可能传入的 context 参数
+            # 兼容 handler(args) 或 handler(context, **kwargs)
+            sig = inspect.signature(handler)
+            try:
+                if len(sig.parameters) >= 2:
+                    # 假设是 handler(context, **kwargs)
+                    res = await handler(*args, **kwargs) if inspect.iscoroutinefunction(handler) else handler(*args, **kwargs)
+                else:
+                    # 假设是 handler(args)
+                    res = await handler(kwargs) if inspect.iscoroutinefunction(handler) else handler(kwargs)
+                return res
+            except Exception as e:
+                return f"工具执行出错: {str(e)}"
+    
+    return DynamicToolProxy()
+
+@register("astrbot_plugin_tool_maker", "Gemini CLI", "AI能力制造引擎", "1.5.1")
 class ToolMakerPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -15,116 +59,121 @@ class ToolMakerPlugin(Star):
         if not os.path.exists(self.tools_dir):
             os.makedirs(self.tools_dir)
         
-        # 内部命名空间，用于持久化运行时的函数
-        self.namespace = {
-            "context": context,
-            "logger": logger
-        }
+        # 记录动态工具
+        self.dynamic_tools = {}
+        self.load_saved_tools()
 
-    # 使用指令和 Action 双重身份
-    # AI 可以通过 Function Calling 调用这些方法
-    
-    @filter.command("define_tool")
-    async def define_tool(self, event: AstrMessageEvent, name: str, description: str, code: str):
+    def load_saved_tools(self):
+        if not os.path.exists(self.tools_dir):
+            return
+        count = 0
+        for filename in os.listdir(self.tools_dir):
+            if filename.endswith(".json"):
+                try:
+                    with open(os.path.join(self.tools_dir, filename), 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        # 这里我们只记录，实际调用通过代理执行
+                        self.dynamic_tools[data['name']] = data
+                        count += 1
+                except Exception as e:
+                    logger.error(f"加载工具配置 {filename} 失败: {e}")
+        if count > 0:
+            logger.info(f"已加载 {count} 个动态工具配置")
+
+    @filter.llm_tool(name="define_tool")
+    async def define_tool(self, event: AstrMessageEvent, name: str, description: str, python_code: str):
         """
-        为自己定义一个新的持久化工具。
-        参数:
-        name (string): 工具名称（英文）
-        description (string): 工具功能描述
-        code (string): Python 代码，必须包含 handler(args_dict) 函数。
+        为自己定义一个新的持久化工具（能力）。
+        
+        Args:
+            name (string): 工具的英文唯一标识名。
+            description (string): 详细描述工具的功能和参数。
+            python_code (string): Python 代码。必须包含 async def handler(args: dict) 函数。可以通过 args.get('param_name') 获取参数。
         """
         try:
-            # 简单验证代码语法
-            compile(code, "<string>", "exec")
+            # 语法检查
+            compile(python_code, "<string>", "exec")
             
             data = {
                 "name": name,
                 "description": description,
-                "code": code
+                "code": python_code
             }
             filepath = os.path.join(self.tools_dir, f"{name}.json")
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             
-            yield event.plain_result(f"工具 '{name}' 已保存。你可以通过 call_tool 来使用它。")
+            self.dynamic_tools[name] = data
+            return ToolExecResult(status=True, result=f"工具 '{name}' 定义成功。现在你可以直接通过 call_tool(name='{name}', args=...) 来调用它。")
         except Exception as e:
-            yield event.plain_result(f"定义失败: {str(e)}")
+            return ToolExecResult(status=False, result=f"定义失败: {str(e)}")
 
-    @filter.command("call_tool")
+    @filter.llm_tool(name="call_tool")
     async def call_tool(self, event: AstrMessageEvent, name: str, args: dict = None):
         """
-        调用你之前定义过的工具。
-        参数:
-        name (string): 工具名称
-        args (dict): 传递给工具 handler 的参数字典
+        执行你之前定义的工具。
+        
+        Args:
+            name (string): 要调用的工具名称。
+            args (dict): 传递给工具的参数字典。
         """
-        filepath = os.path.join(self.tools_dir, f"{name}.json")
-        if not os.path.exists(filepath):
-            yield event.plain_result(f"未找到工具: {name}")
-            return
+        if name not in self.dynamic_tools:
+            return ToolExecResult(status=False, result=f"未找到工具: {name}")
 
+        data = self.dynamic_tools[name]
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # 动态执行代码
-            local_ns = {}
-            exec(data['code'], self.namespace, local_ns)
+            local_ns = {"event": event, "context": self.context}
+            exec(data['code'], globals(), local_ns)
             handler = local_ns.get('handler')
             
             if not handler:
-                yield event.plain_result(f"错误: 工具 '{name}' 中未找到 handler 函数。")
-                return
+                return ToolExecResult(status=False, result="错误: 代码中未找到 handler 函数。")
 
-            # 执行逻辑
-            if args is None: args = {}
+            actual_args = args if args else {}
             if inspect.iscoroutinefunction(handler):
-                result = await handler(args)
+                result = await handler(actual_args)
             else:
-                result = handler(args)
+                result = handler(actual_args)
             
-            yield event.plain_result(f"工具 '{name}' 运行结果: \n{result}")
+            return ToolExecResult(status=True, result=str(result))
         except Exception as e:
-            yield event.plain_result(f"工具运行出错: {str(e)}")
+            return ToolExecResult(status=False, result=f"运行出错: {str(e)}")
 
-    @filter.command("run_python")
-    async def run_python(self, event: AstrMessageEvent, code: str):
+    @filter.llm_tool(name="run_python_repl")
+    async def run_python_repl(self, event: AstrMessageEvent, code: str):
         """
-        直接运行一段 Python 代码并返回结果（REPL）。
+        即时执行一段 Python 代码并获取结果。适用于临时计算或单次任务。
+        
+        Args:
+            code (string): 要执行的 Python 代码。如果需要返回结果，请将结果赋值给变量 'result'。
         """
         try:
-            # 捕获 print 输出或返回最后一行表达式的值
-            # 这里简化处理，直接执行并捕获异常
-            local_ns = {}
-            exec(code, self.namespace, local_ns)
-            # 如果定义了 result 变量，则返回它
-            res = local_ns.get('result', "执行成功（无返回结果）")
-            yield event.plain_result(f"代码运行结果: {res}")
+            local_ns = {"event": event, "context": self.context}
+            exec(code, globals(), local_ns)
+            res = local_ns.get('result', "执行完成，无 result 返回值。")
+            return ToolExecResult(status=True, result=str(res))
         except Exception as e:
-            yield event.plain_result(f"运行失败: {str(e)}")
+            return ToolExecResult(status=False, result=f"执行失败: {str(e)}")
 
     @filter.command("tools")
-    async def list_tools(self, event: AstrMessageEvent):
-        """列出所有已定义的工具"""
-        tools = []
-        if os.path.exists(self.tools_dir):
-            for filename in os.listdir(self.tools_dir):
-                if filename.endswith(".json"):
-                    with open(os.path.join(self.tools_dir, filename), 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        tools.append(f"- {data['name']}: {data['description']}")
-        
-        if not tools:
+    async def list_tools_cmd(self, event: AstrMessageEvent):
+        """列出所有动态定义的工具"""
+        if not self.dynamic_tools:
             yield event.plain_result("目前还没有定义的工具。")
-        else:
-            yield event.plain_result("已定义的能力列表：\n" + "\n".join(tools))
+            return
+        
+        msg = "已定义的能力列表：\n"
+        for name, data in self.dynamic_tools.items():
+            msg += f"- {name}: {data['description']}\n"
+        yield event.plain_result(msg)
 
     @filter.command("deltool")
-    async def delete_tool(self, event: AstrMessageEvent, name: str):
+    async def delete_tool_cmd(self, event: AstrMessageEvent, name: str):
         """删除一个能力"""
         filepath = os.path.join(self.tools_dir, f"{name}.json")
         if os.path.exists(filepath):
             os.remove(filepath)
+            self.dynamic_tools.pop(name, None)
             yield event.plain_result(f"能力 '{name}' 已删除。")
         else:
             yield event.plain_result(f"未找到能力: {name}")
