@@ -40,8 +40,8 @@ def create_dynamic_tool_instance(name, description, schema, code):
 
 @dataclass
 class ToolMakerTool(FunctionTool):
-    # 将 plugin 定义为一个字段，默认值为 None
-    plugin: any = None
+    # 严格按照 FunctionTool 可能要求的顺序定义字段
+    # 不要在这里放任何非 Pydantic 字段
     name: str = "create_new_tool"
     description: str = "为机器人创建一个新的持久化工具。你需要提供工具名称、描述、JSON Schema 参数定义以及 Python 代码。代码中必须包含 handler(context, **kwargs) 函数。"
     parameters: dict = Field(
@@ -69,6 +69,10 @@ class ToolMakerTool(FunctionTool):
         schema = kwargs.get("parameters_schema")
         code = kwargs.get("python_code")
         
+        # 这里的 self.plugin 是在外部手动赋值的
+        if not hasattr(self, 'plugin'):
+            return "插件上下文未就绪。"
+
         try:
             # 尝试创建实例以验证代码
             tool_instance = create_dynamic_tool_instance(name, description, schema, code)
@@ -80,7 +84,6 @@ class ToolMakerTool(FunctionTool):
                 "parameters": schema,
                 "code": code
             }
-            # 注意：这里的 self.plugin 是在实例化时传入的
             filepath = os.path.join(self.plugin.tools_dir, f"{name}.json")
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -101,8 +104,13 @@ class ToolMakerPlugin(Star):
         if not os.path.exists(self.tools_dir):
             os.makedirs(self.tools_dir)
             
-        # 注册工具制造者工具，显式传递 plugin 参数
-        self.context.add_llm_tools(ToolMakerTool(plugin=self))
+        # 1. 先实例化 Tool (不传参数给构造函数，避免 Pydantic 验证错误)
+        tool = ToolMakerTool()
+        # 2. 手动绑定插件实例
+        tool.plugin = self
+        
+        # 3. 注册工具
+        self.context.add_llm_tools(tool)
             
         # 加载已保存的工具
         self.load_saved_tools()
