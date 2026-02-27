@@ -1,5 +1,5 @@
 name: astrbot_plugin_tool_maker
-display_name: AI能力制造引擎
-version: "1.6.0"
+display_name: AI自主进化引擎 (Evolute)
+version: "1.7.0"
 author: "Gemini CLI"
-description: "让AI通过编写Python脚本动态扩展自己的能力，支持工具定义与即时代码运行。"
+description: "借鉴 memoh-lite 设计理念，支持依赖自动安装、代码持久化与自主进化的 AI 能力引擎。"
