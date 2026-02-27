@@ -3,7 +3,6 @@ import json
 import inspect
 import logging
 from pydantic import Field
-from pydantic.dataclasses import dataclass
 from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.agent.run_context import ContextWrapper
@@ -12,7 +11,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 logger = logging.getLogger("astrbot")
 
 def create_dynamic_tool_instance(name, description, schema, code):
-    """动态创建一个 FunctionTool 实例"""
+    """动态创建一个工具实例"""
     namespace = {}
     exec(code, namespace)
     handler = namespace.get('handler')
@@ -20,11 +19,12 @@ def create_dynamic_tool_instance(name, description, schema, code):
     if not handler:
         raise ValueError("代码中未找到 handler 函数")
 
-    @dataclass
     class DynamicTool(FunctionTool):
-        name: str = name
-        description: str = description
-        parameters: dict = Field(default_factory=lambda: schema)
+        def __init__(self):
+            # 避开 Pydantic 的 __init__，直接设置属性
+            object.__setattr__(self, "name", name)
+            object.__setattr__(self, "description", description)
+            object.__setattr__(self, "parameters", schema)
 
         async def call(self, context: ContextWrapper, **kwargs) -> ToolExecResult:
             try:
@@ -37,13 +37,17 @@ def create_dynamic_tool_instance(name, description, schema, code):
     
     return DynamicTool()
 
-@dataclass
 class ToolMakerTool(FunctionTool):
-    # 严格按照规范：只定义 LLM 需要的字段
-    name: str = "create_new_tool"
-    description: str = "为机器人创建一个新的持久化工具。代码中必须包含 handler(context, **kwargs) 函数。"
-    parameters: dict = Field(
-        default_factory=lambda: {
+    """
+    不使用 @dataclass，手动管理属性以避开 Pydantic 验证
+    """
+    def __init__(self, plugin_instance: 'ToolMakerPlugin'):
+        # 手动设置基类所需的 Pydantic 字段，而不触发验证
+        # 很多时候基类是 pydantic.BaseModel 或 dataclass
+        # 使用 object.__setattr__ 是最安全的绕过方式
+        object.__setattr__(self, "name", "create_new_tool")
+        object.__setattr__(self, "description", "为机器人创建一个新的持久化工具。代码中必须包含 handler(context, **kwargs) 函数。")
+        object.__setattr__(self, "parameters", {
             "type": "object",
             "properties": {
                 "tool_name": {"type": "string", "description": "工具的唯一标识名称（英文）"},
@@ -58,21 +62,11 @@ class ToolMakerTool(FunctionTool):
                 }
             },
             "required": ["tool_name", "tool_description", "parameters_schema", "python_code"]
-        }
-    )
+        })
+        # 存储插件实例用于文件操作
+        self.plugin = plugin_instance
 
     async def call(self, context: ContextWrapper, **kwargs) -> ToolExecResult:
-        # 核心改变：通过 context 获取插件实例，而不是 self.plugin
-        # AstrBot 的 context.context 通常是 AstrAgentContext，它可以访问到加载的插件
-        plugin = None
-        # 尝试从 star_instances 中找到我们的插件
-        # star_instances 是一个字典，键是插件的唯一标识
-        if hasattr(context.context, 'star_instances'):
-            plugin = context.context.star_instances.get("astrbot_plugin_tool_maker")
-        
-        if not plugin:
-            return "错误：无法在当前上下文中找到 ToolMaker 插件实例。"
-
         name = kwargs.get("tool_name")
         description = kwargs.get("tool_description")
         schema = kwargs.get("parameters_schema")
@@ -87,19 +81,19 @@ class ToolMakerTool(FunctionTool):
                 "parameters": schema,
                 "code": code
             }
-            filepath = os.path.join(plugin.tools_dir, f"{name}.json")
+            filepath = os.path.join(self.plugin.tools_dir, f"{name}.json")
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             
-            # 动态注册到上下文
-            plugin.context.add_llm_tools(tool_instance)
+            # 注册到当前上下文
+            self.plugin.context.add_llm_tools(tool_instance)
             
-            return f"成功创建并注册工具：{name}。现在你可以直接使用它了。"
+            return f"成功创建并注册工具：{name}。"
         except Exception as e:
             logger.error(f"创建工具失败: {e}", exc_info=True)
             return f"创建工具失败: {str(e)}"
 
-@register("astrbot_plugin_tool_maker", "Gemini CLI", "自动工具编写插件", "1.2.0")
+@register("astrbot_plugin_tool_maker", "Gemini CLI", "自动工具编写插件", "1.3.0")
 class ToolMakerPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -107,8 +101,8 @@ class ToolMakerPlugin(Star):
         if not os.path.exists(self.tools_dir):
             os.makedirs(self.tools_dir)
             
-        # 严格按照文档：实例化时不传任何参数
-        self.context.add_llm_tools(ToolMakerTool())
+        # 实例化工具并传入插件引用
+        self.context.add_llm_tools(ToolMakerTool(self))
             
         self.load_saved_tools()
 
