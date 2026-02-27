@@ -1,5 +1,5 @@
 name: astrbot_plugin_tool_maker
-display_name: AI自主进化引擎 (Evolute)
-version: "1.7.0"
+display_name: AI自主进化引擎 (Venv隔离版)
+version: "1.8.0"
 author: "Gemini CLI"
-description: "借鉴 memoh-lite 设计理念，支持依赖自动安装、代码持久化与自主进化的 AI 能力引擎。"
+description: "使用 venv 虚拟环境实现 AI 能力的彻底隔离与自主进化。支持自动安装依赖，不污染宿主环境。"
