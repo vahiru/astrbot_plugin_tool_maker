@@ -4,147 +4,138 @@ import sys
 import inspect
 import logging
 import subprocess
-import venv
-import site
+import importlib.util
+from pydantic import Field
+from pydantic.dataclasses import dataclass
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.model import ToolExecResult
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult
+from astrbot.core.agent.run_context import ContextWrapper
 
 logger = logging.getLogger("astrbot")
 
-@register("astrbot_plugin_tool_maker", "Gemini CLI", "AI自主进化引擎(Venv版)", "1.8.0")
-class ToolMakerPlugin(Star):
+def get_dynamic_tool_class(name, description, schema, code, plugin_instance):
+    """
+    在函数内部定义类，彻底躲避框架的启动扫描。
+    """
+    @dataclass
+    class DynamicEvolvedTool(FunctionTool):
+        name: str = name
+        description: str = description
+        parameters: dict = Field(default_factory=lambda: schema)
+
+        async def call(self, context: ContextWrapper, **kwargs) -> ToolExecResult:
+            # 运行时动态执行代码
+            try:
+                # 注入上下文
+                runtime_ns = {
+                    "context": context,
+                    "plugin": plugin_instance,
+                    "logger": logger,
+                    "__name__": f"dynamic_tool_{self.name}"
+                }
+                # 预执行代码以加载环境
+                exec(code, runtime_ns)
+                handler = runtime_ns.get('handler')
+                if not handler:
+                    return ToolExecResult(status=False, result="未找到 handler 函数。")
+                
+                # 执行逻辑
+                if inspect.iscoroutinefunction(handler):
+                    res = await handler(**kwargs)
+                else:
+                    res = handler(**kwargs)
+                return ToolExecResult(status=True, result=str(res))
+            except Exception as e:
+                logger.error(f"工具 {self.name} 执行失败: {e}", exc_info=True)
+                return ToolExecResult(status=False, result=f"执行出错: {str(e)}")
+    
+    return DynamicEvolvedTool()
+
+@register("astrbot_plugin_tool_maker", "Gemini CLI", "Evolute Engine", "2.0.0")
+class EvoluteEngine(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        # 基础路径配置
         self.base_dir = os.path.dirname(__file__)
-        self.tools_dir = os.path.join(self.base_dir, "tools")
-        self.venv_dir = os.path.join(self.base_dir, "evolve_venv")
-        
+        self.tools_dir = os.path.join(self.base_dir, "evolutions")
         if not os.path.exists(self.tools_dir): os.makedirs(self.tools_dir)
         
-        # 初始化虚拟环境
-        self._ensure_venv()
-        
-        self.dynamic_tools = {}
+        # 尝试使用 uv 提升性能 (Python 界的 Bun)
+        self.use_uv = self._check_uv()
         self.load_saved_tools()
 
-    def _ensure_venv(self):
-        """确保虚拟环境存在并激活 site-packages"""
-        if not os.path.exists(self.venv_dir):
-            logger.info(f"正在创建插件私有虚拟环境: {self.venv_dir}")
-            venv.create(self.venv_dir, with_pip=True)
-        
-        # 获取 venv 的 site-packages 路径
-        if sys.platform == "win32":
-            site_packages = os.path.join(self.venv_dir, "Lib", "site-packages")
-        else:
-            # 兼容不同版本的 Python 路径
-            py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-            site_packages = os.path.join(self.venv_dir, "lib", py_ver, "site-packages")
-        
-        if os.path.exists(site_packages):
-            # 动态加入当前进程的搜索路径
-            site.addsitedir(site_packages)
-            logger.info(f"已挂载私有依赖库: {site_packages}")
-        
-        self.venv_pip = os.path.join(self.venv_dir, "Scripts", "pip") if sys.platform == "win32" else os.path.join(self.venv_dir, "bin", "pip")
+    def _check_uv(self):
+        try:
+            subprocess.run(["uv", "--version"], capture_output=True)
+            return True
+        except:
+            return False
 
-    def _install_deps(self, code: str):
-        """分析并安装依赖到 venv"""
+    def _sync_deps(self, code: str):
+        """同步代码中声明的依赖"""
         import re
-        pattern = re.compile(r'^\s*(?:from|import)\s+([a-zA-Z0-9_]+)', re.MULTILINE)
-        modules = set(pattern.findall(code))
-        std_libs = set(sys.builtin_module_names)
-        
-        to_install = []
-        for module in modules:
-            if module in std_libs or module == "astrbot": continue
-            # 尝试导入，看是否已存在于当前路径（包括已挂载的 venv）
-            try:
-                __import__(module)
-            except ImportError:
-                to_install.append(module)
+        # 支持 PEP 723 风格或简单的 import 识别
+        deps = re.findall(r'import\s+([a-zA-Z0-9_]+)', code)
+        # 简单过滤掉内置和框架库
+        to_install = [d for d in set(deps) if d not in sys.builtin_module_names and d != "astrbot"]
         
         if to_install:
-            logger.info(f"正在安装依赖到虚拟环境: {to_install}")
+            cmd = ["uv", "pip", "install"] if self.use_uv else [sys.executable, "-m", "pip", "install"]
             try:
-                subprocess.check_call([self.venv_pip, "install", *to_install, "--quiet"])
-                return True
+                subprocess.check_call(cmd + to_install + ["--quiet"])
+                logger.info(f"依赖同步完成: {to_install}")
             except Exception as e:
-                logger.error(f"Pip 安装失败: {e}")
-                return False
-        return True
+                logger.error(f"依赖同步失败: {e}")
 
     @filter.llm_tool(name="evolute")
-    async def evolute(self, event: AstrMessageEvent, tool_name: str, tool_description: str, python_code: str):
+    async def evolute(self, event: AstrMessageEvent, tool_name: str, tool_description: str, parameters_schema: dict, python_code: str):
         """
-        通过编写 Python 代码为自己进化新能力。
-        代码运行在独立的 venv 虚拟环境中，支持自动安装依赖。
+        [进化能力] 通过编写 Python 代码为自己创造一个全新的、持久化的工具。
+        进化后的工具将直接出现在你的工具列表中，你可以像调用原生工具一样调用它。
         
-        Args:
-            tool_name (string): 英文唯一标识。
-            tool_description (string): 功能描述。
-            python_code (string): 包含 'async def handler(args: dict)' 的代码。
+        规范：
+        1. 必须包含 'async def handler(**kwargs)'。
+        2. 代码中应包含所需的 import。
+        3. parameters_schema 需符合 JSON Schema 规范。
         """
         try:
-            # 安装依赖到私有 venv
-            self._install_deps(python_code)
+            # 1. 同步依赖
+            self._sync_deps(python_code)
             
-            # 语法检查
-            compile(python_code, f"<evolve_{tool_name}>", "exec")
-            
-            data = {"name": tool_name, "description": tool_description, "code": python_code}
+            # 2. 验证与持久化
+            data = {
+                "name": tool_name,
+                "description": tool_description,
+                "parameters": parameters_schema,
+                "code": python_code
+            }
             with open(os.path.join(self.tools_dir, f"{tool_name}.json"), 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             
-            self.dynamic_tools[tool_name] = data
-            return ToolExecResult(status=True, result=f"进化完成。依赖已安装至私有 venv。工具 '{tool_name}' 已就绪。")
+            # 3. 实时注册为 LLM 工具 (一级公民)
+            tool_inst = get_dynamic_tool_class(tool_name, tool_description, parameters_schema, python_code, self)
+            self.context.add_llm_tools(tool_inst)
+            
+            return ToolExecResult(status=True, result=f"进化成功！能力 '{tool_name}' 已实时植入你的神经中枢。现在你可以直接调用它了。")
         except Exception as e:
             return ToolExecResult(status=False, result=f"进化失败: {str(e)}")
 
-    @filter.llm_tool(name="call_tool")
-    async def call_tool(self, event: AstrMessageEvent, tool_name: str, args: dict = None):
-        """执行已进化的工具"""
-        if tool_name not in self.dynamic_tools:
-            return ToolExecResult(status=False, result=f"未找到工具: {tool_name}")
-
-        data = self.dynamic_tools[tool_name]
-        try:
-            runtime_ns = {"event": event, "context": self.context, "logger": logger, "__name__": "__main__"}
-            exec(data['code'], globals(), runtime_ns)
-            handler = runtime_ns.get('handler')
-            
-            if not handler: return ToolExecResult(status=False, result="未找到 handler 函数。")
-            
-            res = await handler(args or {}) if inspect.iscoroutinefunction(handler) else handler(args or {})
-            return ToolExecResult(status=True, result=str(res))
-        except Exception as e:
-            return ToolExecResult(status=False, result=f"运行报错: {str(e)}")
-
     def load_saved_tools(self):
+        """启动时加载所有已进化的能力"""
+        if not os.path.exists(self.tools_dir): return
         for filename in os.listdir(self.tools_dir):
             if filename.endswith(".json"):
-                with open(os.path.join(self.tools_dir, filename), 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.dynamic_tools[data['name']] = data
-
-    @filter.command("env_reset")
-    async def env_reset(self, event: AstrMessageEvent):
-        """管理指令：重置并清理虚拟环境"""
-        import shutil
-        if os.path.exists(self.venv_dir):
-            shutil.rmtree(self.venv_dir)
-        self._ensure_venv()
-        yield event.plain_result("私有虚拟环境已重置。")
+                try:
+                    with open(os.path.join(self.tools_dir, filename), 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    tool_inst = get_dynamic_tool_class(data['name'], data['description'], data['parameters'], data['code'], self)
+                    self.context.add_llm_tools(tool_inst)
+                except Exception as e:
+                    logger.error(f"加载进化能力 {filename} 失败: {e}")
 
     @filter.command("tools")
-    async def list_tools_cmd(self, event: AstrMessageEvent):
-        """管理指令：列出所有已进化的能力"""
-        if not self.dynamic_tools:
-            yield event.plain_result("目前还没有进化的能力。")
-            return
-        msg = "🚀 已进化的能力列表：\n"
-        for name, data in self.dynamic_tools.items():
-            msg += f"- {name}: {data['description']}\n"
-        yield event.plain_result(msg)
+    async def list_evolutions(self, event: AstrMessageEvent):
+        """查看当前已进化的所有能力"""
+        tools = [f[:-5] for f in os.listdir(self.tools_dir) if f.endswith(".json")]
+        if not tools: yield event.plain_result("暂无已进化的能力。")
+        else: yield event.plain_result("🧬 已进化能力：\n" + "\n".join(tools))
