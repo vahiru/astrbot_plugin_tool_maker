@@ -1,5 +1,5 @@
 name: astrbot_plugin_tool_maker
 display_name: AI能力制造引擎
-version: "1.5.1"
+version: "1.6.0"
 author: "Gemini CLI"
 description: "让AI通过编写Python脚本动态扩展自己的能力，支持工具定义与即时代码运行。"

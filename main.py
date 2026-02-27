@@ -51,7 +51,7 @@ def create_dynamic_tool_instance(name, description, schema, code):
     
     return DynamicToolProxy()
 
-@register("astrbot_plugin_tool_maker", "Gemini CLI", "AI能力制造引擎", "1.5.1")
+@register("astrbot_plugin_tool_maker", "Gemini CLI", "AI能力制造引擎", "1.6.0")
 class ToolMakerPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
